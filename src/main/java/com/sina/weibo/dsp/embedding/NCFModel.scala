@@ -44,6 +44,7 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
     // initialize embeddings
     randomInitialize(userPSMatrix, rand.nextInt())
     randomInitialize(itemPSMatrix, rand.nextInt())
+    randomInitialize(w1Matrix, rand.nextInt())
 
     // 模型预测, 给定itemId，计算与之相似的itemID集合
     def predict(dataSet: RDD[Int], topK: Int): Array[(Int, Array[(Int, Double)])] = {
