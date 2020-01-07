@@ -58,7 +58,7 @@ object NCFTest {
                                 zhongrui3_hot_click_data where dt=$dt
                                 order by uuid, act_time ASC
                             ) AS C
-                        group by C.uuid limit 2100000"""
+                        group by C.uuid limit 210"""
         val topSql =
             s"""select xid, click
                |from zhongrui3_xid_click

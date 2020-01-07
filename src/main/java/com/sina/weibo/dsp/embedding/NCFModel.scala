@@ -36,7 +36,7 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
 
     val w1Matrix: PSMatrix = createPSMatrix(2, numCol, rowsInBlock, colsInBlock)
     val w1MatrixId: Int = w1Matrix.id
-    val bias1: Double = 0.0
+    var bias1: Double = 0.0
 
     val h1Vector: PSVector = createVector(2)
 
@@ -133,7 +133,7 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
                         val userVector = userPSMatrix.pull(f._1)
                         val dotRes = f._2.map{p =>
                             val pitemVector = itemPSMatrix.pull(p)
-                            sigmoid(pitemVector.dot(userVector))
+                            forward(userVector, pitemVector)
                         }
                         dotRes
                     } catch {
@@ -142,13 +142,11 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
                             new Array[Double](f._2.length).map(f => 0.0)
                         }
                     }
-
                 }
 //                batchY.foreach(p => println("sgdForSingleBatch_modelRes=", p.mkString(", ")))
                 // 计算梯度损失
                 val loss = doBatchLoss(batchY)
                 println("sgdForSingleBatch_mean_loss=", loss)
-                //            batchY.foreach(p => println("sgdForSingleBatch_grad_loss=", p.mkString(", ")))
                 // 梯度调整并回传
                 adjustGrad(partitionId, batchY, batch, alpha, index)
                 println("sgdForSingleBatch_finish_partitionId=", partitionId, " index=", index)
@@ -160,7 +158,6 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
                 }
             }
         }
-
         PSContext.instance()
         val batchIter = new Iterator[Array[(Int, Array[Int], Array[Int])]] {
             override def hasNext: Boolean = iter.hasNext
@@ -187,52 +184,30 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
     def adjustGrad(partitionId: Int, batchY: Array[Array[Double]],
                    batch: Array[(Int, Array[Int], Array[Int])],
                    alpha: Double, index: Int): Unit = {
-        // 自己推导梯度公式
-        //                f(i) = 2 * alpha * (label - y_^) * y_^ * (1 - y_^)
         batchY.zip(batch).foreach { case (y, signleData) =>
             val uid = signleData._1
             val itemIds = signleData._2
             val label = 1.0
-            val item_grad = new mutable.HashMap[Int, Vector]()
             try {
                 val userRowVector = userPSMatrix.pull(uid)
-                val userRowValues = userRowVector.getStorage.asInstanceOf[DoubleVectorStorage].getValues
-                // 计算物品Embedding梯度并更新,// 保存物品Embedding的均值数组，用于后面计算用户梯度
-                val mean = new Array[Double](numCol)
+                // 收集梯度
+                val grads = new util.ArrayList[(Vector, Vector, Vector, Double, Vector, Vector)]()
+                val itemRowVecotrs = new util.ArrayList[Vector]()
                 itemIds.zip(y).foreach { case (itemId, y_^) =>
                     try {
                         val itemRowVector = itemPSMatrix.pull(itemId)
-                        val itemRowValues = itemRowVector.getStorage.asInstanceOf[DoubleVectorStorage].getValues
-                        val l = -2 * y_^ * (1 - y_^) * (label - y_^)
-                        val delta = userRowValues.map(f => f * l)
-
-                        // 计算物品Embedding均值与物品梯度
-                        for (i <- itemRowValues.indices) {
-                            mean(i) += itemRowValues(i) * l
-                            itemRowValues(i) = itemRowValues(i) + alpha * delta(i)
-                        }
-                        // 保存远程物品Embedding
-//                        itemPSMatrix.update(itemId, itemRowVector)
-                        item_grad.put(itemId, itemRowVector)
+                        grads.add(backward(userRowVector, itemRowVector, label))
+                        itemRowVecotrs.add(itemRowVector)
                     } catch {
                         case e: Throwable => println("adjustGrad_calGrad error! partitionID=", partitionId, " index=", index, e.printStackTrace())
                     }
                 }
-                // 计算用户Embedding梯度并更新
-                val userDelta = mean.map(f => f / itemIds.length)
-                for (i <- userRowValues.indices) {
-                    userRowValues(i) = userRowValues(i) + alpha * userDelta(i)
-                }
-                userPSMatrix.update(uid, userRowVector)
-                // 更新物品Embedding
-                println("item_grad=", item_grad.mkString(","))
-                item_grad.map(f=>itemPSMatrix.update(f._1, f._2))
+                updateGrad(grads, alpha, uid, itemIds, userRowVector, itemRowVecotrs)
             } catch {
                 case e: Throwable => println("adjustGrad_error! partitionId=", partitionId, " index=", index, e.printStackTrace())
             }
         }
     }
-
     // 随机梯度下降，其他优化算法，后续再增加
     def doBatchLoss(batchY: Array[Array[Double]]): Double = {
         val loss = batchY.map { f =>
@@ -261,7 +236,7 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
         y
     }
     // 模型反向计算梯度
-    def backward(loss:Double, itemVector: Vector, userVector: Vector):
+    def backward(userVector: Vector, itemVector: Vector, label:Double):
     (Vector, Vector, Vector, Double, Vector, Vector)={
         val g = itemVector.dot(userVector)
         val w1 = w1Matrix.pull(0)
@@ -277,7 +252,7 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
         val g_d_user = itemVector
         val g_d_item = userVector
 
-        val loss_d_y = 2 * (y-1)
+        val loss_d_y = 2 * (y-label)
 
         val y_d_h1 = y * (1-y) * g
         val y_d_h2 = y * (1-y) * m
@@ -294,7 +269,43 @@ class NCFModel(userRow: Int, itemRow: Int, numCol: Int,
             y_d_user.mul(loss_d_y),
             y_d_item.mul(loss_d_y))
     }
+    def updateGrad(grads:util.ArrayList[(Vector, Vector, Vector, Double, Vector, Vector)],
+                   alpha:Double, userId:Int, itemIds:Array[Int],
+                   userVector:Vector, itemVector:util.ArrayList[Vector]):Unit={
+        // 更新h变量参数
+        val h1Sum = VFactory.denseDoubleVector(Array(0.0, 0.0))
+        grads.map(f=>h1Sum.add(f._1))
+        h1Sum.div(itemIds.length*1.0).mul(alpha)
+        println("updateGrad_h1Sum=", h1Sum.getStorage.asInstanceOf[DoubleVectorStorage].getValues.mkString(","))
+        println("updateGrad_h1Vector=", h1Vector.pull().getStorage.asInstanceOf[DoubleVectorStorage].getValues.mkString(","))
+        h1Vector.push(h1Vector.pull().add(h1Sum))
+        println("updateGrad_h1VectorNew=", h1Vector.pull().getStorage.asInstanceOf[DoubleVectorStorage].getValues.mkString(","))
 
+        //更新w1和b变量参数
+        val w1Sum = VFactory.denseDoubleVector((for(i <- 1 to numCol)yield 0.0).toArray)
+        val w2Sum = VFactory.denseDoubleVector((for(i <- 1 to numCol)yield 0.0).toArray)
+        var bias = 0.0
+        grads.map(f=>w1Sum.add(f._2))
+        grads.map(f=>w2Sum.add(f._3))
+        grads.map(f=>bias+=f._4)
+        w1Sum.div(itemIds.length).mul(alpha)
+        w2Sum.div(itemIds.length).mul(alpha)
+        bias /= itemIds.length
+        w1Matrix.push(0, w1Matrix.pull(0).add(w1Sum))
+        w1Matrix.push(1, w1Matrix.pull(1).add(w2Sum))
+        bias1 += bias*alpha
+
+        // 更新用户和物品Embedding
+        val userSum = VFactory.denseDoubleVector((for(i <- 1 to numCol)yield 0.0).toArray)
+        val itemSum = VFactory.denseDoubleVector((for(i <- 1 to numCol)yield 0.0).toArray)
+        grads.map(f=>userSum.add(f._5))
+        grads.map(f=>itemSum.add(f._6))
+        userSum.div(itemIds.length).mul(alpha)
+        itemSum.div(itemIds.length).mul(alpha)
+        println("updateGrad_itemSum=", itemSum.getStorage.asInstanceOf[DoubleVectorStorage].getValues.mkString(","))
+        userPSMatrix.update(userId, userPSMatrix.pull(userId).add(userSum))
+        itemIds.foreach(f=> itemPSMatrix.push(f, itemPSMatrix.pull(f).add(itemSum)))
+    }
     def sigmoid(x: Double): Double = 1.0 / (1.0 + Math.exp(-x))
 
     def log(x: Double): Double = Math.log(x)
